@@ -344,19 +344,48 @@ static void send_LIST(ftppsp_client_info_t *client, const char *path) {
     client_send_ctrl_msg(client, "226 Transfer complete.\r\n");
 }
 
+/* Normalize the argument of LIST into an absolute FTP path:
+ *   no argument or flags ("-a", "-la") -> current directory
+ *   "/"                                -> device list
+ *   "/ms0:", "ms0:", "/ms0:/"          -> "/ms0:/"   (a device root needs its slash)
+ *   "/ms0:/PSP/"                       -> "/ms0:/PSP" (Getstat/Dopen reject a trailing slash)
+ *   "PSP"                              -> relative to the current directory
+ * The previous code silently listed the current directory whenever the
+ * argument failed sceIoGetstat (device roots, trailing slashes), and passed
+ * nullptr to FS::FileExists() for "LIST /", crashing the console. */
+static void resolve_list_path(const ftppsp_client_info_t *client, char *out, size_t out_size) {
+    char arg[512] = {0};
+    int n = std::sscanf(client->recv_cmd_args, "%511[^\r\n\t]", arg);
+
+    if (n < 1 || arg[0] == '-') {
+        std::snprintf(out, out_size, "%s", client->cur_path);
+        return;
+    }
+
+    if (arg[0] == '/')
+        std::snprintf(out, out_size, "%s", arg);
+    else if (std::strchr(arg, ':') != nullptr)
+        std::snprintf(out, out_size, "/%s", arg);
+    else {
+        size_t cur_len = std::strlen(client->cur_path);
+        const char *sep = (cur_len > 0 && client->cur_path[cur_len - 1] == '/') ? "" : "/";
+        std::snprintf(out, out_size, "%s%s%s", client->cur_path, sep, arg);
+    }
+
+    size_t len = std::strlen(out);
+    while (len > 1 && out[len - 1] == '/')
+        out[--len] = '\0';
+
+    if (len > 1 && out[len - 1] == ':' && std::strchr(out + 1, '/') == nullptr && len + 1 < out_size) {
+        out[len] = '/';
+        out[len + 1] = '\0';
+    }
+}
+
 static void cmd_LIST_func(ftppsp_client_info_t *client) {
-    char list_path[512] = {0};
-    int list_cur_path = 1;
-    
-    int n = std::sscanf(client->recv_cmd_args, "%[^\r\n\t]", list_path);
-    
-    if (n > 0 && FS::FileExists(get_psp_path(list_path)))
-        list_cur_path = 0;
-        
-    if (list_cur_path)
-        send_LIST(client, client->cur_path);
-    else
-        send_LIST(client, list_path);
+    char list_path[1024] = {0};
+    resolve_list_path(client, list_path, sizeof(list_path));
+    send_LIST(client, list_path);
 }
 
 static void cmd_PWD_func(ftppsp_client_info_t *client) {
